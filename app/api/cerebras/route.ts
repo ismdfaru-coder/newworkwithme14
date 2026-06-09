@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server"
 
-const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY_4
 const CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 export async function POST(request: NextRequest) {
   try {
     if (!CEREBRAS_API_KEY) {
-      return NextResponse.json({ error: "CEREBRAS_API_KEY is not set" }, { status: 500 })
+      return NextResponse.json({ error: "CEREBRAS_API_KEY_4 is not set" }, { status: 500 })
     }
 
     const { prompt, model = "gpt-oss-120b", stream = false } = await request.json()
@@ -34,8 +34,8 @@ export async function POST(request: NextRequest) {
             content: prompt
           }
         ],
-        temperature: 0.7,
-        max_tokens: 4096,
+        temperature: 0.2,
+        max_completion_tokens: 1024,
         top_p: 1,
       }),
     })
