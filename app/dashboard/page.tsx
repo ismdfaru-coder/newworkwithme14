@@ -209,7 +209,7 @@ export default function DashboardPage() {
           },
           body: JSON.stringify({ 
             prompt: userMessage.content,
-            model: "llama3.1-8b"
+            model: "gpt-oss-120b"
           }),
         })
 
