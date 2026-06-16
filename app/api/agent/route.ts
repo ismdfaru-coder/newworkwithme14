@@ -1,357 +1,216 @@
 // app/api/agent/route.ts
-// WorkwithMe AI Agent API implementation with full output parsing and file downloads
+// WorkwithMe AI Agent — streams a Manus v2 task as a verbose SSE timeline.
 
-export const runtime = "nodejs";
-export const maxDuration = 300;
+import { manus, ManusError, type TaskEvent, type AgentProfile } from "@/lib/manus"
 
-const MANUS_API_URL = "https://api.manus.ai";
-const MANUS_API_KEY = process.env.MANUS_API_KEY || "";
-
-// Helper to get auth headers - Manus uses "API_KEY" header
-const getAuthHeaders = () => ({
-  "API_KEY": MANUS_API_KEY,
-  "Content-Type": "application/json",
-});
-
-// Message content types
-interface OutputText {
-  type: "output_text";
-  text: string;
-}
-
-interface OutputFile {
-  type: "output_file";
-  fileUrl: string;
-  fileName: string;
-  mimeType: string;
-}
-
-type MessageContent = OutputText | OutputFile;
-
-// Task message structure
-interface TaskMessage {
-  id: string;
-  status: string;
-  role: "user" | "assistant";
-  type: string;
-  content: MessageContent[];
-}
-
-// Task metadata
-interface TaskMetadata {
-  task_title?: string;
-  task_url?: string;
-  [key: string]: string | undefined;
-}
-
-// Full task response from GET /v1/tasks/{task_id}
-interface TaskResponse {
-  id: string;
-  object: string;
-  created_at: number;
-  updated_at: number;
-  status: "pending" | "running" | "completed" | "failed";
-  error?: string;
-  incomplete_details?: string;
-  instructions?: string;
-  model?: string;
-  metadata?: TaskMetadata;
-  output?: TaskMessage[];
-  credit_usage?: number;
-}
-
-// Response from POST /v1/tasks
-interface TaskCreatedResponse {
-  id: string;
-  metadata?: TaskMetadata;
-  status?: string;
-}
-
-async function createTask(prompt: string): Promise<TaskCreatedResponse> {
-  const res = await fetch(`${MANUS_API_URL}/v1/tasks`, {
-    method: "POST",
-    headers: getAuthHeaders(),
-    body: JSON.stringify({ 
-      prompt: prompt,
-      mode: "agent",
-    }),
-  });
-  
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Failed to create task: ${res.status} - ${errText}`);
-  }
-  
-  const data = await res.json();
-  
-  // Handle different response structures - Manus may return task_id instead of id
-  return {
-    id: data.id || data.task_id,
-    metadata: data.metadata,
-    status: data.status,
-  };
-}
-
-async function getTaskStatus(taskId: string): Promise<TaskResponse> {
-  const res = await fetch(`${MANUS_API_URL}/v1/tasks/${taskId}?convert=true`, {
-    method: "GET",
-    headers: getAuthHeaders(),
-  });
-  
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Failed to get task status: ${res.status} - ${errText}`);
-  }
-  
-  return res.json();
-}
-
-// Parse task output to extract text and files
-function parseTaskOutput(output: TaskMessage[]): { 
-  texts: string[]; 
-  files: OutputFile[];
-  steps: string[];
-} {
-  const texts: string[] = [];
-  const files: OutputFile[] = [];
-  const steps: string[] = [];
-
-  for (const message of output) {
-    if (message.role === "assistant" && message.content) {
-      for (const content of message.content) {
-        if (content.type === "output_text" && content.text) {
-          texts.push(content.text);
-          // Extract step-like content from text
-          const lines = content.text.split('\n').filter(l => l.trim());
-          for (const line of lines) {
-            if (line.length < 200) {
-              steps.push(line);
-            }
-          }
-        } else if (content.type === "output_file") {
-          files.push(content as OutputFile);
-        }
-      }
-    }
-  }
-
-  return { texts, files, steps };
-}
+export const runtime = "nodejs"
+export const maxDuration = 300
 
 export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const query = searchParams.get("query") ?? "";
+  const { searchParams } = new URL(req.url)
+  const query = searchParams.get("query") ?? ""
+  const agentProfile = (searchParams.get("profile") as AgentProfile) || "manus-1.6"
+  const projectId = searchParams.get("projectId") || undefined
+  const interactive = searchParams.get("interactive") === "true"
 
   if (!query) {
-    return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 });
+    return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 })
+  }
+  if (!process.env.MANUS_API_KEY) {
+    return new Response(JSON.stringify({ error: "MANUS_API_KEY environment variable is not set" }), { status: 500 })
   }
 
-  if (!MANUS_API_KEY) {
-    return new Response(JSON.stringify({ error: "MANUS_API_KEY environment variable is not set" }), { status: 500 });
-  }
-
-  const encoder = new TextEncoder();
+  const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (event: string, data: object) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      let closed = false
+      const send = (event: string, data: object) => {
+        if (closed) return
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+      }
 
       try {
-        // ── 1. Create task ─────────────────────────────
-        send("step", { type: "info", desc: "Creating AI task...", icon: "thinking" });
+        send("step", { type: "info", desc: "Creating AI task...", icon: "thinking" })
 
-        const taskResponse = await createTask(query);
-        
-        if (!taskResponse.id) {
-          throw new Error("Invalid response: missing task id");
-        }
+        const created = await manus.task.create({
+          message: { content: query },
+          agent_profile: agentProfile,
+          interactive_mode: interactive,
+          ...(projectId ? { project_id: projectId } : {}),
+        })
 
-        const taskId = taskResponse.id;
-        const taskUrl = taskResponse.metadata?.task_url || `https://manus.im/app/${taskId}`;
+        const taskId = created.task_id
+        if (!taskId) throw new Error("Invalid response: missing task id")
 
-        send("step", { type: "success", desc: `Task created successfully`, icon: "check" });
-        
-        // Send task info
-        send("session", {
-          taskId: taskId,
-          taskUrl: taskUrl,
-          status: "pending",
-        });
+        const taskUrl = created.task_url || `https://manus.im/app/${taskId}`
+        send("step", { type: "success", desc: "Task created successfully", icon: "check" })
+        send("session", { taskId, taskUrl, status: "running" })
+        send("step", {
+          type: "info",
+          desc: `Processing: "${query.slice(0, 50)}${query.length > 50 ? "..." : ""}"`,
+          icon: "processing",
+        })
 
-        send("step", { type: "info", desc: `Processing: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}"`, icon: "processing" });
+        const maxPolls = 280 // ~280 * 2s ≈ 9.3 min
+        let pollCount = 0
+        const seenEventIds = new Set<string>()
+        let lastStatus = "running"
+        let cursor: string | undefined
+        let finished = false
 
-        // ── 2. Poll for task completion with detailed updates ──────────────────────────────────────
-        const maxPolls = 180; // 6 minutes max (2s intervals)
-        let pollCount = 0;
-        let lastStatus = "pending";
-        let lastOutputLength = 0;
-        let sentSteps = new Set<string>();
-        let lastResponseTime = Date.now();
-        let continueSent = false;
+        const emitEvent = (e: TaskEvent) => {
+          if (seenEventIds.has(e.id)) return
+          seenEventIds.add(e.id)
 
-        // Wait a bit before first poll
-        await new Promise(r => setTimeout(r, 2000));
-
-        while (pollCount < maxPolls) {
-          await new Promise(r => setTimeout(r, 2000));
-          
-          let currentTask: TaskResponse;
-          try {
-            currentTask = await getTaskStatus(taskId);
-          } catch (e) {
-            // Task might not be ready yet, continue polling
-            pollCount++;
-            if (pollCount % 10 === 0) {
-              send("step", { type: "info", desc: `Waiting for AI... (${pollCount * 2}s)`, icon: "waiting" });
-            }
-            continue;
-          }
-
-          // Send status update if changed
-          if (currentTask.status !== lastStatus) {
-            const statusMessages: Record<string, { desc: string; icon: string }> = {
-              "pending": { desc: "Task queued, waiting to start...", icon: "waiting" },
-              "running": { desc: "AI is working on your task...", icon: "processing" },
-              "completed": { desc: "Task completed successfully!", icon: "check" },
-              "failed": { desc: currentTask.error || "Task failed", icon: "error" },
-            };
-            const statusInfo = statusMessages[currentTask.status] || { desc: `Status: ${currentTask.status}`, icon: "info" };
-            send("step", { 
-              type: currentTask.status === "completed" ? "success" : 
-                    currentTask.status === "failed" ? "error" : "info",
-              desc: statusInfo.desc,
-              icon: statusInfo.icon
-            });
-            lastStatus = currentTask.status;
-          }
-
-          // Stream intermediate output as it comes
-          if (currentTask.output && currentTask.output.length > lastOutputLength) {
-            const { texts, files, steps } = parseTaskOutput(currentTask.output);
-            
-            // Send new steps that haven't been sent yet
-            for (const step of steps) {
-              const stepKey = step.substring(0, 100);
-              if (!sentSteps.has(stepKey)) {
-                sentSteps.add(stepKey);
-                send("step", { type: "info", desc: step, icon: "action" });
+          switch (e.type) {
+            case "explanation":
+              if (e.explanation?.content)
+                send("step", { type: "info", desc: e.explanation.content, icon: "thinking" })
+              break
+            case "new_plan_step":
+              if (e.new_plan_step?.title)
+                send("step", { type: "info", desc: `Plan: ${e.new_plan_step.title}`, icon: "action" })
+              break
+            case "plan_update":
+              if (e.plan_update?.steps)
+                send("plan", { steps: e.plan_update.steps })
+              break
+            case "tool_used":
+              if (e.tool_used)
+                send("step", {
+                  type: e.tool_used.status === "error" ? "error" : "info",
+                  desc: e.tool_used.brief || e.tool_used.description || `Used ${e.tool_used.tool}`,
+                  icon: "tool",
+                  tool: e.tool_used.tool,
+                })
+              break
+            case "assistant_message":
+              if (e.assistant_message?.content)
+                send("message", { content: e.assistant_message.content })
+              for (const a of e.assistant_message?.attachments ?? [])
+                send("file", { fileName: a.filename, fileUrl: a.url, mimeType: a.content_type, kind: a.type })
+              break
+            case "error_message":
+              if (e.error_message?.content)
+                send("step", { type: "error", desc: e.error_message.content, icon: "error" })
+              break
+            case "status_update": {
+              const su = e.status_update
+              if (su?.agent_status === "waiting" && su.status_detail?.waiting_for_event_id) {
+                send("waiting", {
+                  taskId,
+                  eventId: su.status_detail.waiting_for_event_id,
+                  eventType: su.status_detail.waiting_for_event_type,
+                  inputSchema: su.status_detail.confirm_input_schema,
+                })
               }
+              break
             }
-            
-            // Send files as they become available
-            for (const file of files) {
-              send("file", {
-                fileName: file.fileName,
-                fileUrl: file.fileUrl,
-                mimeType: file.mimeType,
-              });
-            }
-            
-            lastOutputLength = currentTask.output.length;
-            lastResponseTime = Date.now(); // Reset timer when we get new output
-          }
-
-          // Check if no response for 1 minute (60 seconds) - send "continue" prompt
-          const timeSinceLastResponse = Date.now() - lastResponseTime;
-          if (timeSinceLastResponse >= 60000 && !continueSent && currentTask.status === "running") {
-            send("step", { type: "info", desc: "No response for 1 minute, sending continue...", icon: "waiting" });
-            
-            try {
-              // Create a new task with "continue" prompt referencing the original task
-              await createTask("continue");
-              continueSent = true;
-              lastResponseTime = Date.now(); // Reset timer after sending continue
-              send("step", { type: "info", desc: "Continue prompt sent", icon: "action" });
-            } catch (e) {
-              send("step", { type: "info", desc: "Could not send continue prompt", icon: "error" });
-            }
-          }
-
-          // Check if task is complete
-          if (currentTask.status === "completed") {
-            // Parse final output
-            if (currentTask.output && currentTask.output.length > 0) {
-              const { texts, files } = parseTaskOutput(currentTask.output);
-              
-              // Send all files
-              send("files", { 
-                files: files.map(f => ({
-                  fileName: f.fileName,
-                  fileUrl: f.fileUrl,
-                  mimeType: f.mimeType,
-                }))
-              });
-              
-              // Send result text
-              const resultText = texts.join('\n\n');
-              send("result", { 
-                output: resultText,
-                success: true,
-                taskUrl: taskUrl,
-                creditUsage: currentTask.credit_usage,
-              });
-              
-              send("summary", { 
-                text: resultText,
-                taskTitle: currentTask.metadata?.task_title || "Task Completed",
-              });
-            }
-            
-            break;
-          }
-
-          // Check for failed status
-          if (currentTask.status === "failed") {
-            send("step", { 
-              type: "error", 
-              desc: currentTask.error || "Task failed",
-              icon: "error"
-            });
-            if (currentTask.incomplete_details) {
-              send("step", { type: "info", desc: currentTask.incomplete_details, icon: "info" });
-            }
-            break;
-          }
-
-          pollCount++;
-          
-          // Send progress indicator every 20 seconds
-          if (pollCount % 10 === 0) {
-            send("step", { 
-              type: "info", 
-              desc: `Still working... (${pollCount * 2}s elapsed)`,
-              icon: "waiting"
-            });
           }
         }
 
-        if (pollCount >= maxPolls) {
-          send("step", { type: "error", desc: "Polling timeout reached. Task may still be running.", icon: "error" });
+        await new Promise((r) => setTimeout(r, 1500))
+
+        while (pollCount < maxPolls && !finished) {
+          await new Promise((r) => setTimeout(r, 2000))
+          pollCount++
+
+          let page: Awaited<ReturnType<typeof manus.task.listMessages>>
+          try {
+            page = await manus.task.listMessages({
+              task_id: taskId,
+              verbose: true,
+              order: "asc",
+              limit: 100,
+              cursor,
+            })
+          } catch {
+            if (pollCount % 10 === 0)
+              send("step", { type: "info", desc: `Waiting for AI... (${pollCount * 2}s)`, icon: "waiting" })
+            continue
+          }
+
+          for (const e of page.messages) emitEvent(e)
+
+          // Advance the cursor only when there are no more pages, so we always
+          // re-scan the tail for the latest status; keep paging when has_more.
+          if (page.has_more && page.next_cursor) {
+            cursor = page.next_cursor
+            continue
+          }
+
+          // Determine current status from the latest status_update we've seen.
+          let current = lastStatus
+          for (let i = page.messages.length - 1; i >= 0; i--) {
+            const s = page.messages[i].status_update?.agent_status
+            if (s) {
+              current = s
+              break
+            }
+          }
+
+          if (current !== lastStatus) {
+            lastStatus = current
+            const map: Record<string, { desc: string; icon: string }> = {
+              running: { desc: "AI is working on your task...", icon: "processing" },
+              waiting: { desc: "Waiting for your confirmation...", icon: "waiting" },
+              error: { desc: "Task encountered an error", icon: "error" },
+              stopped: { desc: "Task completed", icon: "check" },
+            }
+            const info = map[current] || { desc: `Status: ${current}`, icon: "info" }
+            send("step", {
+              type: current === "stopped" ? "success" : current === "error" ? "error" : "info",
+              desc: info.desc,
+              icon: info.icon,
+            })
+          }
+
+          if (current === "stopped") {
+            // Agent finished its turn. Emit a final result summary.
+            const finalText = page.messages
+              .filter((e) => e.type === "assistant_message")
+              .map((e) => e.assistant_message?.content)
+              .filter(Boolean)
+              .join("\n\n")
+            const files = page.messages
+              .flatMap((e) => e.assistant_message?.attachments ?? [])
+              .map((a) => ({ fileName: a.filename, fileUrl: a.url, mimeType: a.content_type }))
+            send("files", { files })
+            send("result", { output: finalText, success: true, taskUrl })
+            send("summary", { text: finalText, taskTitle: created.task_title || "Task Completed" })
+            finished = true
+            break
+          }
+
+          if (current === "error") {
+            finished = true
+            break
+          }
+
+          if (pollCount % 15 === 0)
+            send("step", { type: "info", desc: `Still working... (${pollCount * 2}s elapsed)`, icon: "waiting" })
         }
 
-        send("done", { message: "AI task finished." });
+        if (!finished && pollCount >= maxPolls)
+          send("step", { type: "error", desc: "Polling timeout reached. Task may still be running.", icon: "error" })
 
+        send("done", { message: "AI task finished.", taskId })
       } catch (err: unknown) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        
-        // Handle specific errors
-        if (errorMessage.includes("401") || errorMessage.includes("403") || errorMessage.includes("Unauthorized") || errorMessage.includes("unauthorized")) {
-          send("agent_error", { 
-            message: "Invalid API key. Please check your MANUS_API_KEY environment variable." 
-          });
-        } else if (errorMessage.includes("402") || errorMessage.includes("quota") || errorMessage.includes("limit")) {
-          send("agent_error", { 
-            message: "API quota exceeded. Please check your Manus account." 
-          });
+        const msg = err instanceof ManusError ? err.message : err instanceof Error ? err.message : String(err)
+        if (/401|403|unauthorized/i.test(msg)) {
+          send("agent_error", { message: "Invalid API key. Please check your MANUS_API_KEY environment variable." })
+        } else if (/402|quota|limit/i.test(msg)) {
+          send("agent_error", { message: "API quota exceeded. Please check your Manus account." })
         } else {
-          send("agent_error", { message: errorMessage });
+          send("agent_error", { message: msg })
         }
       } finally {
-        controller.close();
+        closed = true
+        controller.close()
       }
     },
-  });
+  })
 
   return new Response(stream, {
     headers: {
@@ -359,20 +218,19 @@ export async function GET(req: Request) {
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     },
-  });
+  })
 }
 
-// POST endpoint for more complex requests
+// POST endpoint mirrors GET via query params for convenience.
 export async function POST(req: Request) {
-  const body = await req.json();
-  const { query } = body;
+  const body = await req.json()
+  const { query, profile, projectId, interactive } = body
+  if (!query) return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 })
 
-  if (!query) {
-    return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 });
-  }
-
-  const url = new URL(req.url);
-  url.searchParams.set("query", query);
-  
-  return GET(new Request(url.toString()));
+  const url = new URL(req.url)
+  url.searchParams.set("query", query)
+  if (profile) url.searchParams.set("profile", profile)
+  if (projectId) url.searchParams.set("projectId", projectId)
+  if (interactive) url.searchParams.set("interactive", "true")
+  return GET(new Request(url.toString()))
 }

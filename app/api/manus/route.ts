@@ -1,134 +1,165 @@
-import { NextRequest, NextResponse } from "next/server"
+import { type NextRequest, NextResponse } from "next/server"
+import {
+  manus,
+  ManusError,
+  collectAssistantText,
+  collectAttachments,
+  deriveUiStatus,
+  getPendingConfirmation,
+  latestPlan,
+  type AgentProfile,
+  type ShareVisibility,
+} from "@/lib/manus"
 
-const MANUS_API_URL = "https://api.manus.ai/v1/tasks"
+export const runtime = "nodejs"
 
+/**
+ * POST /api/manus
+ * Creates a Manus v2 task. Backwards compatible: returns `{ task_id, id }`.
+ * Accepts the legacy `{ prompt, taskMode }` shape plus new v2 options.
+ */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { prompt, taskMode = "chat" } = body
+    const {
+      prompt,
+      taskId,
+      projectId,
+      agentProfile = "manus-1.6",
+      interactiveMode = false,
+      shareVisibility = "private",
+      connectors,
+      enableSkills,
+      hideInTaskList,
+    } = body as {
+      prompt?: string
+      taskId?: string
+      projectId?: string
+      agentProfile?: AgentProfile
+      interactiveMode?: boolean
+      shareVisibility?: ShareVisibility
+      connectors?: string[]
+      enableSkills?: string[]
+      hideInTaskList?: boolean
+    }
 
     if (!prompt) {
-      return NextResponse.json(
-        { error: "Prompt is required" },
-        { status: 400 }
-      )
+      return NextResponse.json({ error: "Prompt is required" }, { status: 400 })
     }
 
-    const apiKey = process.env.MANUS_API_KEY
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "MANUS_API_KEY is not configured" },
-        { status: 500 }
-      )
+    const message = {
+      content: prompt,
+      ...(connectors?.length ? { connectors } : {}),
+      ...(enableSkills?.length ? { enable_skills: enableSkills } : {}),
     }
 
-    console.log("[v0] POST to Manus API:", { prompt: prompt.substring(0, 50), taskMode })
-    
-    const response = await fetch(MANUS_API_URL, {
-      method: "POST",
-      headers: {
-        "API_KEY": apiKey,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        prompt,
-        agentProfile: "manus-1.6",
-        taskMode,
-      }),
+    // If a taskId is provided, this is a follow-up message in an existing task.
+    if (taskId) {
+      const sent = await manus.task.sendMessage({
+        task_id: taskId,
+        message,
+        agent_profile: agentProfile,
+      })
+      return NextResponse.json({ task_id: taskId, id: taskId, request_id: sent.request_id })
+    }
+
+    const created = await manus.task.create({
+      message,
+      agent_profile: agentProfile,
+      interactive_mode: interactiveMode,
+      share_visibility: shareVisibility,
+      ...(projectId ? { project_id: projectId } : {}),
+      ...(hideInTaskList ? { hide_in_task_list: true } : {}),
     })
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.log("[v0] POST Error:", response.status, errorText)
-      return NextResponse.json(
-        { error: `Manus API error: ${response.status} - ${errorText}` },
-        { status: response.status }
-      )
-    }
-
-    const data = await response.json()
-    console.log("[v0] POST Response from Manus:", JSON.stringify(data, null, 2))
-    return NextResponse.json(data)
+    return NextResponse.json({
+      task_id: created.task_id,
+      id: created.task_id,
+      task_title: created.task_title,
+      task_url: created.task_url,
+      share_url: created.share_url,
+      request_id: created.request_id,
+    })
   } catch (error) {
-    console.error("Error calling Manus API:", error)
-    return NextResponse.json(
-      { error: "Failed to process request" },
-      { status: 500 }
-    )
+    if (error instanceof ManusError) {
+      return NextResponse.json({ error: error.message, request_id: error.requestId }, { status: error.status })
+    }
+    console.error("[v0] Error creating Manus task:", error)
+    return NextResponse.json({ error: "Failed to process request" }, { status: 500 })
   }
 }
 
-// Get task status with convert=true for final output
-// Includes retry logic for 404 errors (task may not be immediately available after creation)
+/**
+ * GET /api/manus?taskId=...&verbose=true
+ * Polls a task and returns an aggregated view. Backwards compatible: exposes
+ * a `status` of completed/running/etc. and a `result` string for legacy callers,
+ * plus the full v2 `events`, `plan`, `attachments`, and `pendingConfirmation`.
+ */
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const taskId = searchParams.get("taskId")
-  const isFirstPoll = searchParams.get("firstPoll") === "true"
+  const verbose = searchParams.get("verbose") !== "false"
 
   if (!taskId) {
-    return NextResponse.json(
-      { error: "Task ID is required" },
-      { status: 400 }
-    )
-  }
-
-  const apiKey = process.env.MANUS_API_KEY
-  if (!apiKey) {
-    return NextResponse.json(
-      { error: "MANUS_API_KEY is not configured" },
-      { status: 500 }
-    )
-  }
-
-  // Add a delay on first poll to allow task to be created in Manus system
-  if (isFirstPoll) {
-    console.log("[v0] First poll - waiting 2.5s for task to be created...")
-    await new Promise(resolve => setTimeout(resolve, 2500))
+    return NextResponse.json({ error: "Task ID is required" }, { status: 400 })
   }
 
   try {
-    const url = `${MANUS_API_URL}/${taskId}?convert=true`
-    console.log("[v0] GET from Manus API:", url)
-    
-    // Retry logic for 404 errors (task may not be immediately available)
-    let response: Response | null = null
-    let retries = 5
-    
-    while (retries > 0) {
-      response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "API_KEY": apiKey,
-        },
+    // Fetch detail + all messages. Page through messages to get the full timeline.
+    const events = [] as Awaited<ReturnType<typeof manus.task.listMessages>>["messages"]
+    let cursor: string | undefined
+    let detailStatus: Awaited<ReturnType<typeof manus.task.detail>>["task"] | undefined
+
+    try {
+      const detail = await manus.task.detail(taskId)
+      detailStatus = detail.task
+    } catch {
+      // detail can lag right after creation; ignore and rely on messages
+    }
+
+    // Collect up to a few pages of events.
+    for (let page = 0; page < 8; page++) {
+      const res = await manus.task.listMessages({
+        task_id: taskId,
+        verbose,
+        order: "asc",
+        limit: 100,
+        cursor,
       })
-      
-      // If 404, wait and retry - task may not be available yet
-      if (response.status === 404 && retries > 1) {
-        console.log("[v0] Task not found, retrying in 2s... (retries left:", retries - 1, ")")
-        await new Promise(resolve => setTimeout(resolve, 2000))
-        retries--
-        continue
-      }
-      break
+      events.push(...res.messages)
+      if (!res.has_more || !res.next_cursor) break
+      cursor = res.next_cursor
     }
 
-    if (!response || !response.ok) {
-      const errorText = await response?.text() || "Unknown error"
-      console.log("[v0] GET Error:", response?.status, errorText)
-      return NextResponse.json(
-        { error: `Manus API error: ${response?.status} - ${errorText}` },
-        { status: response?.status || 500 }
-      )
-    }
+    const uiStatus = deriveUiStatus(events, detailStatus?.status)
+    const pending = getPendingConfirmation(events)
+    const text = collectAssistantText(events)
+    const attachments = collectAttachments(events)
+    const plan = latestPlan(events)
 
-    const data = await response.json()
-    console.log("[v0] GET Response from Manus:", JSON.stringify(data, null, 2))
-    return NextResponse.json(data)
+    // Legacy status: map "stopped" with no pending confirmation to "completed".
+    const legacyStatus =
+      uiStatus === "stopped" ? "completed" : uiStatus === "waiting" ? "waiting" : uiStatus
+
+    return NextResponse.json({
+      task_id: taskId,
+      status: legacyStatus,
+      uiStatus,
+      result: text,
+      output: text,
+      attachments,
+      plan,
+      events,
+      pendingConfirmation: pending,
+      task: detailStatus,
+      creditUsage: detailStatus?.credit_usage,
+      taskUrl: detailStatus?.task_url,
+    })
   } catch (error) {
-    console.error("Error fetching task status:", error)
-    return NextResponse.json(
-      { error: "Failed to fetch task status" },
-      { status: 500 }
-    )
+    if (error instanceof ManusError) {
+      return NextResponse.json({ error: error.message, request_id: error.requestId }, { status: error.status })
+    }
+    console.error("[v0] Error fetching Manus task:", error)
+    return NextResponse.json({ error: "Failed to fetch task status" }, { status: 500 })
   }
 }
